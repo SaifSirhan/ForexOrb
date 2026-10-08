@@ -1,34 +1,41 @@
-"""Price chart for the ForexOrb GUI.
+"""Candlestick chart for the ForexOrb GUI.
 
-Downloads the last 5 days of GC=F H1 candles and renders them as a close
-line with the daily Asian session shaded and alert markers overlaid.
+Downloads GC=F candles for the selected timeframe and renders them as a
+lightweight-charts candlestick series (QtWebEngine backend), with the daily
+Asian session drawn as a shaded price box per day and alert markers overlaid.
 
-  build_chart(parent) -> the matplotlib canvas widget to embed
+  TIMEFRAMES       -> ordered timeframe keys shown in the dropdown
+  fetch_candles(tf) -> DataFrame ready for Chart.set(), on a UTC index
+  build_chart(parent, chart, tf) -> draws onto an existing QtChart
 """
 
 import csv
 import os
 from datetime import datetime, time, timezone
 
-import matplotlib
-
-matplotlib.use("TkAgg")
-
 import pandas as pd
 import yfinance as yf
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+from lightweight_charts.widgets import QtChart
 
 import config
 
 PAIR = config.PAIRS[0] if config.PAIRS else "GC=F"
-PERIOD = "5d"
-INTERVAL = "1h"
 
-BAND_COLOR = "#3a3a3a"
-LINE_COLOR = "#d8d8d8"
+# Timeframe key -> (interval, period). The 4h key is fetched as 1h and
+# resampled locally; yfinance has no native 4h interval for futures.
+TIMEFRAMES = {
+    "5m": ("5m", "5d"),
+    "15m": ("15m", "5d"),
+    "1h": ("1h", "1mo"),
+    "4h": ("1h", "1mo"),
+    "1D": ("1d", "6mo"),
+}
+DEFAULT_TIMEFRAME = "1h"
+
 UP_COLOR = "#2fbf71"
 DOWN_COLOR = "#e5484d"
+BAND_LINE = "#6a6a6a"
+BAND_FILL = "rgba(120, 120, 120, 0.18)"
 
 
 def _to_utc(df):
@@ -45,17 +52,68 @@ def _to_utc(df):
     return df
 
 
-def fetch_candles():
-    """Last 5 days of H1 candles on a UTC index, NaN closes dropped."""
-    df = yf.Ticker(PAIR).history(period=PERIOD, interval=INTERVAL,
+def _resample_4h(df):
+    """Aggregate 1h candles into 4h bars, labelled at the window open.
+
+    label/closed='left' puts the bar at the start of the 4h window, which
+    is how the Asian 00:00 bucket lines up with the 00:00-05:00 range.
+    """
+    out = df.resample("4h", label="left", closed="left").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+    })
+    return out.dropna(subset=["Close"])
+
+
+def fetch_candles(timeframe=DEFAULT_TIMEFRAME):
+    """Download candles for `timeframe` on a UTC index, NaN closes dropped.
+
+    Returns a DataFrame indexed by tz-aware UTC timestamps with Open/High/
+    Low/Close columns. Blocking network call: run in a worker thread.
+    """
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"unknown timeframe {timeframe!r}")
+
+    interval, period = TIMEFRAMES[timeframe]
+    df = yf.Ticker(PAIR).history(period=period, interval=interval,
                                  auto_adjust=False)
     if df is None or df.empty:
         raise ValueError("yfinance returned no rows")
 
     df = _to_utc(df)
+    df = df[["Open", "High", "Low", "Close"]]
     df = df[df["Close"].notna()]
+
+    if timeframe == "4h":
+        df = _resample_4h(df)
+
     df = df.sort_index()
+    if df.empty:
+        raise ValueError("no candles left after cleaning")
     return df
+
+
+def to_chart_frame(df):
+    """Convert an OHLC frame into the lowercase frame Chart.set() expects.
+
+    lightweight_charts lowercases columns and reads the datetime from a
+    `time` column or from a `date`/`time` index, then converts to epoch
+    seconds and quantises to the inferred bar interval.
+
+    The time column is forced to nanosecond resolution: the library divides
+    the int64 epoch by 10**9, which only yields seconds for datetime64[ns].
+    A datetime64[s] index (as yfinance gives here) would collapse every bar
+    to epoch second 1 and the chart would render a single stacked bar.
+    """
+    out = df.rename(columns={
+        "Open": "open", "High": "high", "Low": "low", "Close": "close",
+    }).copy()
+    out.index.name = "time"
+    out = out.reset_index()
+    out["time"] = pd.to_datetime(out["time"]).astype("datetime64[ns, UTC]")
+    return out
 
 
 def read_alerts(path):
@@ -82,8 +140,6 @@ def read_alerts(path):
                 alerts.append({
                     "when": stamp.replace(tzinfo=timezone.utc),
                     "direction": direction,
-                    "pair": (row.get("pair") or "").strip(),
-                    "close": (row.get("close_price") or "").strip(),
                 })
     except (OSError, csv.Error):
         return alerts
@@ -91,99 +147,78 @@ def read_alerts(path):
     return alerts
 
 
-def _shade_asian_sessions(ax, df):
-    """Light grey vertical band over each day's 00:00-05:00 UTC window."""
+def _asian_boxes(chart, df):
+    """Shade each day's 00:00-05:00 UTC range as a Box primitive.
+
+    The high/low of the candles inside the window bound the box vertically;
+    days with no candles in the window are skipped.
+    """
+    start_h = config.ASIAN_START_HOUR
+    end_h = config.ASIAN_END_HOUR
+
     for day in sorted({d.date() for d in df.index}):
-        start = datetime.combine(day, time(config.ASIAN_START_HOUR),
-                                 tzinfo=timezone.utc)
-        end = datetime.combine(day, time(config.ASIAN_END_HOUR),
-                               tzinfo=timezone.utc)
-        ax.axvspan(start, end, color=BAND_COLOR, alpha=0.45, linewidth=0, zorder=0)
+        win_start = datetime.combine(day, time(start_h), tzinfo=timezone.utc)
+        win_end = datetime.combine(day, time(end_h), tzinfo=timezone.utc)
+        window = df[(df.index >= win_start) & (df.index < win_end)]
+        if window.empty:
+            continue
+        high = float(window["High"].max())
+        low = float(window["Low"].min())
+        # The box spans [win_start, win_end]; the last candle in the window
+        # is the right edge so the primitive lands on real bar times.
+        right = window.index[-1].to_pydatetime()
+        chart.box(win_start, high, right, low,
+                  color=BAND_LINE, fill_color=BAND_FILL,
+                  width=1, style="solid", round=False)
 
 
-def _mark_alerts(ax, df, alerts):
-    """Arrow at each alert whose timestamp matches a candle in range."""
+def _mark_alerts(chart, df, alerts):
+    """Arrow marker at each alert whose timestamp matches a candle."""
     if not alerts:
         return
 
     known = set(df.index)
     label = config.PAIR_LABELS.get(PAIR, PAIR)
+    last = df.index[-1]
 
     for alert in alerts:
         when = alert["when"]
         if when not in known:
             continue
+        # A marker cannot be placed beyond the last bar.
+        if when > last:
+            continue
 
-        price = float(df.loc[when, "Close"])
         if alert["direction"] == "BREAK_UP":
-            colour, marker, offset, va = UP_COLOR, "^", 14, "bottom"
+            chart.marker(time=when, position="below", shape="arrow_up",
+                         color=UP_COLOR, text=label)
         else:
-            colour, marker, offset, va = DOWN_COLOR, "v", -14, "top"
-
-        ax.plot(when, price, marker=marker, color=colour, markersize=9,
-                zorder=5, linestyle="none")
-        ax.annotate(label, xy=(when, price), xytext=(0, offset),
-                    textcoords="offset points", ha="center", va=va,
-                    color=colour, fontsize=8, zorder=6)
+            chart.marker(time=when, position="above", shape="arrow_down",
+                         color=DOWN_COLOR, text=label)
 
 
-def draw_chart(fig, df=None, alerts_path=None):
-    """(Re)draw the chart onto fig from already-downloaded `df`.
+def draw_chart(chart, df=None, alerts_path=None):
+    """(Re)draw onto an existing QtChart from already-downloaded `df`.
 
-    Tk and matplotlib are not thread-safe, so this must run on the main
-    thread. `df` is produced by fetch_candles() in a worker thread.
+    Qt/WebEngine is not thread-safe, so this must run on the main thread.
+    `df` is produced by fetch_candles() in a worker thread.
     """
     path = alerts_path or config.ALERT_CSV
     if df is None:
         df = fetch_candles()
     alerts = read_alerts(path)
 
-    fig.clear()
-    ax = fig.add_subplot(111)
-    ax.set_facecolor("#1e1e1e")
-
-    _shade_asian_sessions(ax, df)
-    ax.plot(df.index, df["Close"], color=LINE_COLOR, linewidth=1.2, zorder=3)
-    _mark_alerts(ax, df, alerts)
-
-    ax.set_title(f"{PAIR} last 5 days (UTC)", color="#e6e6e6", fontsize=11)
-    ax.grid(True, color="#4a4a4a", linewidth=0.5, alpha=0.6)
-    ax.tick_params(colors="#b0b0b0", labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color("#4a4a4a")
-    ax.margins(x=0.01)
-    fig.autofmt_xdate(rotation=20, ha="right")
-    fig.tight_layout()
+    chart.set(to_chart_frame(df))
+    _asian_boxes(chart, df)
+    _mark_alerts(chart, df, alerts)
+    chart.fit()
     return len(alerts)
 
 
-def draw_error(fig, exc):
-    """Render a short failure note in place of the chart. Main thread only."""
-    fig.clear()
-    ax = fig.add_subplot(111)
-    ax.set_facecolor("#1e1e1e")
-    ax.text(0.5, 0.5, f"Chart unavailable\n{type(exc).__name__}: {exc}",
-            ha="center", va="center", color="#e5484d",
-            fontsize=10, transform=ax.transAxes, wrap=True)
-    ax.set_axis_off()
+def build_chart(parent, timeframe=DEFAULT_TIMEFRAME):
+    """Create a QtChart embedded in `parent` (a Qt widget).
 
-
-def build_chart(parent):
-    """Build a FigureCanvasTkAgg embedded in `parent`, ready to draw.
-
-    Returns the Tk canvas widget with a `render(df)` attribute attached.
-    Call render() from the main thread after downloading `df` in a worker.
+    Returns the QtChart. Data is supplied later via draw_chart() on the
+    main thread once a worker has downloaded it.
     """
-    fig = Figure(figsize=(8, 3.2), dpi=100, facecolor="#1e1e1e")
-    canvas = FigureCanvasTkAgg(fig, master=parent)
-    widget = canvas.get_tk_widget()
-
-    def render(df):
-        draw_chart(fig, df=df)
-        canvas.draw()
-
-    widget.render = render
-    widget.figure = fig
-    widget.canvas = canvas
-    widget.show_error = lambda exc: (draw_error(fig, exc), canvas.draw())
-    return widget
+    return QtChart(parent, inner_width=1, inner_height=1)
