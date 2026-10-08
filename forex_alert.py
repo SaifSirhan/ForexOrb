@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 import pandas as pd
 import requests
@@ -36,12 +37,31 @@ REQUEST_TIMEOUT = 15
 # --------------------------------------------------------------------------
 
 def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-    )
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    # A scheduled run is headless, so without a file it leaves no trace.
+    os.makedirs(config.LOG_DIR, exist_ok=True)
+    try:
+        file_handler = RotatingFileHandler(
+            config.LOG_FILE,
+            maxBytes=config.LOG_MAX_BYTES,
+            backupCount=config.LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        log.warning("Could not open log file %s: %s", config.LOG_FILE, exc)
 
 
 def load_secrets() -> tuple:
@@ -91,6 +111,8 @@ def fetch_h1(pair: str) -> pd.DataFrame:
         df.index = df.index.tz_convert("UTC")
 
     df = df.sort_index()
+
+    log.info("candles %s -> %s UTC", df.index[0], df.index[-1])
 
     # Drop partial data: the final candle is still forming.
     if len(df) > 1:
@@ -269,11 +291,13 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
         last = df.iloc[-1]
         candle_time = df.index[-1]
 
-        # The candle must have opened at or after 05:00 UTC on its own day.
-        if candle_time.hour < config.LONDON_OPEN_HOUR:
-            log.info("%-7s skip - last close %s is before the %02d:00 UTC session",
+        # The candle must have opened inside the breakout window [05:00, 21:00)
+        # UTC on its own day. Hours at or past the 21:00 rollover belong to the
+        # next day's Asian range, so they must not be scored against this one.
+        if not (config.LONDON_OPEN_HOUR <= candle_time.hour < config.SESSION_END_HOUR):
+            log.info("%-7s skip - last close %s outside %02d:00-%02d:00 UTC window",
                      label, candle_time.strftime("%H:%M"),
-                     config.LONDON_OPEN_HOUR)
+                     config.LONDON_OPEN_HOUR, config.SESSION_END_HOUR)
             return
 
         high, low, count = asian_range(df, candle_time)
@@ -284,7 +308,7 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
 
         close = float(last["Close"])
         pips = range_in_pips(pair, high, low)
-        px = config.PRICE_DECIMALS.get(pair, 5)
+        px = config.PRICE_DECIMALS.get(pair, 2)
 
         if close > high:
             direction = "BREAK_UP"
@@ -292,7 +316,7 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
             direction = "BREAK_DOWN"
         else:
             log.info("%-7s no break - close %.{0}f inside range %.{0}f-%.{0}f".format(px)
-                     % (close, low, high) + f" ({pips:.1f} pts)")
+                     % (label, close, low, high) + f" ({pips:.1f} pts)")
             return
 
         key = _state_key(pair, candle_time, direction)

@@ -18,8 +18,12 @@ INTERVAL_MINUTES = 60
 ASIAN_START_HOUR = 0
 ASIAN_END_HOUR = 5
 
-# No alerts are emitted before the Asian range is complete.
+# No alerts are emitted before the Asian range is complete. The breakout
+# window is [LONDON_OPEN_HOUR, SESSION_END_HOUR) in UTC: candles opening at
+# or after 05:00, and strictly before the 21:00 daily rollover. Candles at
+# 21:00+ belong to the next trading day's Asian range, not this one.
 LONDON_OPEN_HOUR = 5
+SESSION_END_HOUR = 21
 
 # --loop scheduling interval.
 LOOP_MINUTES = 15
@@ -30,6 +34,12 @@ HISTORY_PERIOD = "5d"
 
 LOG_DIR = "logs"
 ALERT_CSV = "logs/alerts.csv"
+
+# Scheduled runs are headless, so every run also appends to this file.
+# Rotated so a long-running loop cannot fill the disk.
+LOG_FILE = "logs/forex_alert.log"
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUP_COUNT = 3
 
 # range_pips now holds points (1 point = 0.10 USD) for gold.
 ALERT_HEADER = [
