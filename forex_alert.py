@@ -1,4 +1,6 @@
-"""Stage 0 forex alert system: London Open Range Breakout.
+"""Stage 0 gold alert system: London Open Range Breakout.
+
+Trades GC=F (gold futures) only.
 
 Data + alerts + logging only. No AI, no trading, no prediction.
 
@@ -107,7 +109,7 @@ def closed_candles(df: pd.DataFrame, as_of: datetime) -> pd.DataFrame:
 
 
 def asian_range(df: pd.DataFrame, day: datetime):
-    """High/low of candles opening in [00:00, 07:00) UTC on `day`'s date.
+    """High/low of candles opening in [00:00, 05:00) UTC on `day`'s date.
 
     Returns (high, low, count) or (None, None, 0) when the window is empty.
     """
@@ -124,9 +126,14 @@ def asian_range(df: pd.DataFrame, day: datetime):
     return float(window["High"].max()), float(window["Low"].min()), len(window)
 
 
-def range_in_pips(pair: str, high: float, low: float) -> int:
-    decimals = config.PIP_DECIMALS.get(pair, 4)
-    return int(round((high - low) * (10 ** decimals)))
+def pip_size(pair: str) -> float:
+    """Price value of one point. Gold: 0.10 USD; forex fallback: 1 pipette."""
+    return config.PIP_SIZE_BY_PAIR.get(pair, config.DEFAULT_PIP_SIZE)
+
+
+def range_in_pips(pair: str, high: float, low: float) -> float:
+    """Range expressed in points (0.1 USD each for gold)."""
+    return round((high - low) / pip_size(pair), 1)
 
 
 # --------------------------------------------------------------------------
@@ -187,9 +194,10 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 def append_csv(pair: str, direction: str, high: float, low: float,
-               pips: int, close: float, when: datetime) -> None:
+               pips: float, close: float, when: datetime) -> None:
     os.makedirs(config.LOG_DIR, exist_ok=True)
     new_file = not os.path.exists(config.ALERT_CSV)
+    px = config.PRICE_DECIMALS.get(pair, 2)
 
     try:
         with open(config.ALERT_CSV, "a", newline="", encoding="utf-8") as fh:
@@ -200,23 +208,23 @@ def append_csv(pair: str, direction: str, high: float, low: float,
                 when.strftime("%Y-%m-%d %H:%M:%S"),
                 pair,
                 direction,
-                f"{high:.5f}",
-                f"{low:.5f}",
+                f"{high:.{px}f}",
+                f"{low:.{px}f}",
                 pips,
-                f"{close:.5f}",
+                f"{close:.{px}f}",
             ])
     except OSError as exc:
         log.error("Could not append to %s: %s", config.ALERT_CSV, exc)
 
 
 def format_alert(pair: str, direction: str, high: float, low: float,
-                 pips: int, close: float, candle_time: datetime) -> str:
+                 pips: float, close: float, candle_time: datetime) -> str:
     label = config.PAIR_LABELS.get(pair, pair)
-    px = config.PRICE_DECIMALS.get(pair, 5)
+    px = config.PRICE_DECIMALS.get(pair, 2)
     stamp = candle_time.strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"{label} {direction} | Asian range {high:.{px}f}\u2013{low:.{px}f} "
-        f"({pips} pips) | Close {close:.{px}f} | {stamp}"
+        f"({pips:.1f} pts) | Close {close:.{px}f} | {stamp}"
     )
 
 
@@ -225,9 +233,9 @@ def format_alert(pair: str, direction: str, high: float, low: float,
 # --------------------------------------------------------------------------
 
 def all_markets_closed(now: datetime) -> bool:
-    """True when FX is closed and no new candle exists.
+    """True when the market is closed and no new candle exists.
 
-    Market: Sunday 21:00 UTC -> Friday 21:00 UTC. Also treats the daily
+    Schedule: Sunday 21:00 UTC -> Friday 21:00 UTC. Also treats the daily
     21:00-22:00 UTC rollover as closed.
     """
     weekday = now.weekday()  # Mon=0 .. Sun=6
@@ -261,10 +269,11 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
         last = df.iloc[-1]
         candle_time = df.index[-1]
 
-        # The candle must have opened at or after the London open on its own day.
+        # The candle must have opened at or after 05:00 UTC on its own day.
         if candle_time.hour < config.LONDON_OPEN_HOUR:
-            log.info("%-7s skip - last close %s is pre-London",
-                     label, candle_time.strftime("%H:%M"))
+            log.info("%-7s skip - last close %s is before the %02d:00 UTC session",
+                     label, candle_time.strftime("%H:%M"),
+                     config.LONDON_OPEN_HOUR)
             return
 
         high, low, count = asian_range(df, candle_time)
@@ -283,7 +292,7 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
             direction = "BREAK_DOWN"
         else:
             log.info("%-7s no break - close %.{0}f inside range %.{0}f-%.{0}f".format(px)
-                     % (close, low, high) + f" ({pips} pips)")
+                     % (close, low, high) + f" ({pips:.1f} pts)")
             return
 
         key = _state_key(pair, candle_time, direction)
@@ -297,7 +306,7 @@ def check_pair(pair: str, token: str, chat_id: str, state: dict,
             append_csv(pair, direction, high, low, pips, close, candle_time)
             state[key] = now.strftime("%Y-%m-%d %H:%M:%S")
             save_state(state)
-            log.info("%-7s ALERT %s (%d pips) - %s", label, direction, pips, message)
+            log.info("%-7s ALERT %s (%.1f pts) - %s", label, direction, pips, message)
         else:
             # Not recorded, so the next run retries the same break.
             log.info("%-7s ALERT %s NOT delivered - will retry next run",
@@ -337,7 +346,7 @@ def run_check() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stage 0 forex London-open range breakout alerts.")
+        description="Stage 0 gold (GC=F) London-open range breakout alerts.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--once", action="store_true", help="run a single check")
     group.add_argument("--loop", action="store_true",

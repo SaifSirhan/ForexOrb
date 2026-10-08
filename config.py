@@ -1,24 +1,25 @@
-"""Configuration for the Stage 0 forex alert system."""
+"""Configuration for the Stage 0 gold alert system."""
 
-PAIRS = ["EURUSD=X", "GBPUSD=X", "GBPJPY=X"]
+# Gold futures only. GC=F tracks spot closely and updates in real time;
+# XAUUSD=X is unreliable and returns stale data on yfinance.
+PAIRS = ["GC=F"]
 
 # Display names used in alerts, CSV rows and console output.
 PAIR_LABELS = {
-    "EURUSD=X": "EURUSD",
-    "GBPUSD=X": "GBPUSD",
-    "GBPJPY=X": "GBPJPY",
+    "GC=F": "GC=F",
 }
 
 TIMEFRAME = "1h"
 INTERVAL_MINUTES = 60
 
 # Asian session window in UTC. The window is [ASIAN_START_HOUR, ASIAN_END_HOUR),
-# i.e. candles timestamped 00:00 through 06:00 inclusive (07:00 belongs to London).
+# i.e. candles timestamped 00:00 through 04:00 inclusive (05:00 belongs to
+# the pre-London gold session and is where breakout checks begin).
 ASIAN_START_HOUR = 0
-ASIAN_END_HOUR = 7
+ASIAN_END_HOUR = 5
 
 # No alerts are emitted before the Asian range is complete.
-LONDON_OPEN_HOUR = 7
+LONDON_OPEN_HOUR = 5
 
 # --loop scheduling interval.
 LOOP_MINUTES = 15
@@ -30,6 +31,7 @@ HISTORY_PERIOD = "5d"
 LOG_DIR = "logs"
 ALERT_CSV = "logs/alerts.csv"
 
+# range_pips now holds points (1 point = 0.10 USD) for gold.
 ALERT_HEADER = [
     "timestamp_utc",
     "pair",
@@ -40,9 +42,13 @@ ALERT_HEADER = [
     "close_price",
 ]
 
-# JPY crosses quote to 3 decimals, everything else to 5. Pip = 10th decimal
-# digit for non-JPY pairs, 100th for JPY pairs.
-PIP_DECIMALS = {"EURUSD=X": 4, "GBPUSD=X": 4, "GBPJPY=X": 2}
-PRICE_DECIMALS = {"EURUSD=X": 5, "GBPUSD=X": 5, "GBPJPY=X": 3}
+# Gold is measured in points, not forex pips: 1 point = 0.10 USD, so a
+# whole-dollar move is 10 points. Retained as a mapping so the pair loop
+# stays reusable if other instruments are ever added back.
+PIP_SIZE_BY_PAIR = {"GC=F": 0.10}
+DEFAULT_PIP_SIZE = 0.0001
+
+# Gold quotes to 2 decimals for display.
+PRICE_DECIMALS = {"GC=F": 2}
 
 STATE_FILE = "logs/alert_state.json"
